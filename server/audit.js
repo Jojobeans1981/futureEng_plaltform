@@ -1,5 +1,6 @@
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
+import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -10,28 +11,53 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-async function callClaude(prompt) {
-  const response = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01'
-    },
-    body: JSON.stringify({
-      model: 'claude-3-5-sonnet-20241022',
-      max_tokens: 4000,
-      messages: [{ role: 'user', content: prompt }]
-    })
-  });
+// Initialize Google Gen AI Client
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`AI Engine Provider Error: ${errText}`);
+/**
+ * Universal LLM Execution Engine with Automatic Gemini Fallback
+ */
+async function callLLM(prompt) {
+  // 1. Primary Call: Anthropic Claude 3.5 Sonnet
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 4000,
+        messages: [{ role: 'user', content: prompt }]
+      })
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`Claude API Error: ${response.status} - ${errText}`);
+    }
+
+    const data = await response.json();
+    return data.content[0].text;
+  } catch (claudeError) {
+    console.warn('[AI PIPELINE WARN] Primary LLM (Claude) failed. Engaging Gemini fallback...', claudeError.message);
+
+    // 2. Secondary Fallback: Gemini 2.5 Pro
+    try {
+      const geminiResponse = await ai.models.generateContent({
+        model: 'gemini-2.5-pro',
+        contents: prompt,
+      });
+
+      console.log('[AI PIPELINE INFO] Gemini fallback successfully generated response.');
+      return geminiResponse.text;
+    } catch (geminiError) {
+      console.error('[AI PIPELINE ERROR] Both Claude and Gemini engines failed:', geminiError.message);
+      throw new Error('All AI synthesis engines failed to generate response.');
+    }
   }
-
-  const data = await response.json();
-  return data.content[0].text;
 }
 
 router.post('/analyze', async (req, res) => {
@@ -42,13 +68,11 @@ router.post('/analyze', async (req, res) => {
     teamSize,
     currentStack,
     revenueModel,
-    monthlyRevenue,
     targetICP,
     conversionRate,
     painPoints,
     deliverableType,
-    scrapedMarkdown,
-    documentContent
+    scrapedMarkdown
   } = req.body;
 
   if (!userId) {
@@ -56,16 +80,36 @@ router.post('/analyze', async (req, res) => {
   }
 
   try {
-    // 1. Atomic Credit Guard
-    const { data: success, error: creditErr } = await supabase.rpc('deduct_user_credit', {
+    // 1. Credit Check & Deduction
+    const { data: creditDeducted, error: creditErr } = await supabase.rpc('deduct_user_credit', {
       user_id_param: userId
     });
 
-    if (creditErr || !success) {
-      return res.status(402).json({ error: 'Insufficient credits or deduction failed.' });
+    const isFreemiumFallback = creditErr || !creditDeducted;
+
+    // 2. Freemium Teaser Path
+    if (isFreemiumFallback) {
+      const fallbackPrompt = `
+You are an Executive SaaS Advisor. Provide a brief 2-paragraph teaser diagnostic for ${companyName} (${industry}).
+Target ICP: ${targetICP}.
+${scrapedMarkdown ? `Site Content Snapshot:\n${scrapedMarkdown.slice(0, 1000)}...` : ''}
+
+Deliverable:
+1. High-Level Positioning Summary (2-3 sentences)
+2. One core bottleneck identified.
+Do not provide full execution roadmaps or asset copy.
+`;
+      const teaserReport = await callLLM(fallbackPrompt);
+
+      return res.json({
+        success: true,
+        isFreemium: true,
+        report: teaserReport,
+        message: 'Free preview generated. Upgrade credits to unlock full roadmap.'
+      });
     }
 
-    // 2. Agent A: Growth & Positioning Evaluation
+    // 3. Full Paid Multi-Agent Pipeline
     const agentAPrompt = `
 You are Agent A: Elite SaaS Growth & Positioning Specialist.
 Evaluate ${companyName}:
@@ -75,23 +119,20 @@ ${scrapedMarkdown ? `\nSCRAPED LANDING PAGE CONTENT:\n${scrapedMarkdown}\n` : ''
 Identify positioning gaps, value proposition weak spots, and conversion leaks. Return 3 actionable fixes.
 `;
 
-    // 3. Agent B: Technical Systems Architecture Evaluation
     const agentBPrompt = `
 You are Agent B: Enterprise Systems Architect.
 Evaluate ${companyName}:
 Tech Stack: ${currentStack} | Team Size: ${teamSize} | Bottlenecks: ${painPoints}
-${documentContent ? `\nSUPPLEMENTAL DOCS:\n${documentContent}\n` : ''}
 
 Identify technical debt, API workflow bottlenecks, and scalability risks. Return 3 technical upgrades.
 `;
 
-    // Execute Agent A & Agent B in Parallel
+    // Execute Agents in Parallel using the resilient caller
     const [growthAnalysis, techAnalysis] = await Promise.all([
-      callClaude(agentAPrompt),
-      callClaude(agentBPrompt)
+      callLLM(agentAPrompt),
+      callLLM(agentBPrompt)
     ]);
 
-    // 4. Agent C: Master Synthesis & Execution Engine
     const synthesisPrompt = `
 You are Agent C: Master Executive Synthesizer for ${companyName}.
 Combine the following evaluations into a cohesive diagnostic report and 90-day action plan:
@@ -110,53 +151,28 @@ Return your output formatted with:
 ## Generated High-Value Assets (Cold Email Copy, Landing Page Copy Fixes, Technical Spec)
 `;
 
-    const finalReport = await callClaude(synthesisPrompt);
+    const finalReport = await callLLM(synthesisPrompt);
 
-    // 5. Save Report to Database
+    // Save report record
     const { data: reportRecord, error: reportErr } = await supabase
       .from('reports')
-      .insert([
-        {
-          user_id: userId,
-          company_name: companyName,
-          deliverable_type: deliverableType,
-          raw_report: finalReport,
-          input_payload: req.body
-        }
-      ])
+      .insert([{ user_id: userId, company_name: companyName, deliverable_type: deliverableType, raw_report: finalReport, input_payload: req.body }])
       .select()
       .single();
 
     if (reportErr) throw reportErr;
 
-    // Create Initial Action Board Items
+    // Seed task board items
     const initialTasks = [
-      {
-        user_id: userId,
-        report_id: reportRecord.id,
-        title: `Fix Core Messaging & Positioning (Growth Agent)`,
-        timeframe: '30 Days',
-        owner: 'Growth Lead'
-      },
-      {
-        user_id: userId,
-        report_id: reportRecord.id,
-        title: `Resolve Tech Bottlenecks & API Pipelines (Systems Agent)`,
-        timeframe: '60 Days',
-        owner: 'Engineering Lead'
-      },
-      {
-        user_id: userId,
-        report_id: reportRecord.id,
-        title: `Deploy Updated Conversion Funnel & Asset Copy`,
-        timeframe: '90 Days',
-        owner: 'Product / Operations'
-      }
+      { user_id: userId, report_id: reportRecord.id, title: 'Fix Core Messaging & Positioning (Growth Agent)', timeframe: '30 Days', owner: 'Growth Lead' },
+      { user_id: userId, report_id: reportRecord.id, title: 'Resolve Tech Bottlenecks & API Pipelines (Systems Agent)', timeframe: '60 Days', owner: 'Engineering Lead' },
+      { user_id: userId, report_id: reportRecord.id, title: 'Deploy Updated Conversion Funnel & Asset Copy', timeframe: '90 Days', owner: 'Product / Operations' }
     ];
 
     await supabase.from('action_items').insert(initialTasks);
 
-    res.json({ success: true, report: finalReport, reportId: reportRecord.id });
+    res.json({ success: true, isFreemium: false, report: finalReport, reportId: reportRecord.id });
+
   } catch (err) {
     console.error('Multi-Agent Analysis Failure:', err);
     res.status(500).json({ error: err.message || 'Diagnostic generation failed.' });

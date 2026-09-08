@@ -12,6 +12,7 @@
   "type": "module",
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
+    "@google/genai": "^2.21.0",
     "@mendable/firecrawl-js": "^4.38.0",
     "@supabase/supabase-js": "^2.115.0",
     "bullmq": "^6.3.4",
