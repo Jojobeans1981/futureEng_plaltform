@@ -15,10 +15,13 @@ const supabase = createClient(
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 /**
- * Universal LLM Execution Engine with Automatic Gemini Fallback
+ * Universal LLM Execution Engine with Forced Gemini Fallback on Anthropic Errors
  */
 async function callLLM(prompt) {
-  // 1. Primary Call: Anthropic Claude 3.5 Sonnet
+  let claudeFailed = false;
+  let errorMessage = '';
+
+  // 1. Attempt Primary Call: Anthropic Claude 3.5 Sonnet
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -34,28 +37,43 @@ async function callLLM(prompt) {
       })
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(`Claude API Error: ${response.status} - ${errText}`);
-    }
-
     const data = await response.json();
-    return data.content[0].text;
-  } catch (claudeError) {
-    console.warn('[AI PIPELINE WARN] Primary LLM (Claude) failed. Engaging Gemini fallback...', claudeError.message);
 
-    // 2. Secondary Fallback: Gemini 2.5 Pro
+    // Check for explicit API error response from Anthropic (HTTP errors or error JSON payload)
+    if (!response.ok || data.error) {
+      claudeFailed = true;
+      errorMessage = data.error?.message || `HTTP ${response.status} - Anthropic Request Failed`;
+      console.warn(`[AI PIPELINE WARN] Anthropic error detected ("${errorMessage}"). Triggering Gemini fallback...`);
+    } else if (data.content && data.content[0]?.text) {
+      return data.content[0].text;
+    } else {
+      claudeFailed = true;
+      errorMessage = 'Invalid response format from Anthropic API.';
+    }
+  } catch (err) {
+    claudeFailed = true;
+    errorMessage = err.message;
+    console.warn(`[AI PIPELINE WARN] Network error contacting Anthropic ("${errorMessage}"). Triggering Gemini fallback...`);
+  }
+
+  // 2. Secondary Fallback: Gemini 3.1 Pro (Fires if Claude fails or returns any credit/status error)
+  if (claudeFailed) {
     try {
+      console.log('[AI PIPELINE INFO] Invoking Gemini 3.1 Pro fallback engine...');
       const geminiResponse = await ai.models.generateContent({
-        model: 'gemini-2.5-pro',
+        model: 'gemini-3.1-pro-preview',
         contents: prompt,
       });
 
-      console.log('[AI PIPELINE INFO] Gemini fallback successfully generated response.');
-      return geminiResponse.text;
+      if (geminiResponse && geminiResponse.text) {
+        console.log('[AI PIPELINE SUCCESS] Gemini successfully generated diagnostic response.');
+        return geminiResponse.text;
+      } else {
+        throw new Error('Gemini returned an empty response.');
+      }
     } catch (geminiError) {
-      console.error('[AI PIPELINE ERROR] Both Claude and Gemini engines failed:', geminiError.message);
-      throw new Error('All AI synthesis engines failed to generate response.');
+      console.error('[AI PIPELINE FATAL] Both Anthropic and Gemini engines failed:', geminiError.message);
+      throw new Error(`AI Engines Failed. Primary (Anthropic): ${errorMessage} | Secondary (Gemini): ${geminiError.message}`);
     }
   }
 }
